@@ -17,14 +17,33 @@ DEVICE_EXTENSIONS := [?]cstring{"VK_KHR_swapchain"};
 
 Context :: struct {
     instance :vk.Instance,
-    window :glfw.WindowHandle,
-    queueFamily
+    window :glfw.WindowHandle, 
+    physicalDevice :vk.PhysicalDevice,
+    swap_chain: Swapchain,
+    surface: vk.SurfaceKHR,
 }
 
 QueueFamilyIndices :: struct {
     graphicsFamily: u32,
 }
 
+Swapchain :: struct {
+	handle: vk.SwapchainKHR,
+	images: []vk.Image,
+	image_views: []vk.ImageView,
+	format: vk.SurfaceFormatKHR,
+	extent: vk.Extent2D,
+	present_mode: vk.PresentModeKHR,
+	image_count: u32,
+	support: SwapChainDetails,
+	framebuffers: []vk.Framebuffer,
+}
+
+SwapChainDetails :: struct{
+	capabilities: vk.SurfaceCapabilitiesKHR,
+	formats: []vk.SurfaceFormatKHR,
+	present_modes: []vk.PresentModeKHR,
+}
 
 findQueueFamilies :: proc(device: vk.PhysicalDevice) -> QueueFamilyIndices {
     indices: QueueFamilyIndices;
@@ -46,45 +65,102 @@ findQueueFamilies :: proc(device: vk.PhysicalDevice) -> QueueFamilyIndices {
     return indices;
 }
 
-pickPhysicalDevice :: proc() {
+checkDeviceExtensionSupport :: proc(physical_device: vk.PhysicalDevice) -> bool {
 
-    physicalDevice :vk.PhysicalDevice;
+    ext_count: u32;
+	vk.EnumerateDeviceExtensionProperties(physical_device, nil, &ext_count, nil);
+	
+	available_extensions := make([]vk.ExtensionProperties, ext_count);
+	vk.EnumerateDeviceExtensionProperties(physical_device, nil, &ext_count, raw_data(available_extensions));
+	
+	for ext in DEVICE_EXTENSIONS
+	{
+		found: b32;
+		for available in &available_extensions
+		{
+			if cstring(&available.extensionName[0]) == ext
+			{
+				found = true;
+				break;
+			}
+		}
+		if !found do return false;
+	}
+	return true;
+}
 
-    deviceCount :u32;
-    vk.EnumeratePhysicalDevices(instance, &deviceCount, nil)
+querySwapChainDetails :: proc(using ctx: ^Context, dev: vk.PhysicalDevice)
+{
+	vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(dev, surface, &swap_chain.support.capabilities);
+	
+	format_count: u32;
+	vk.GetPhysicalDeviceSurfaceFormatsKHR(dev, surface, &format_count, nil);
+	if format_count > 0
+	{
+		swap_chain.support.formats = make([]vk.SurfaceFormatKHR, format_count);
+		vk.GetPhysicalDeviceSurfaceFormatsKHR(dev, surface, &format_count, raw_data(swap_chain.support.formats));
+	}
+	
+	present_mode_count: u32;
+	vk.GetPhysicalDeviceSurfacePresentModesKHR(dev, surface, &present_mode_count, nil);
+	if present_mode_count > 0
+	{
+		swap_chain.support.present_modes = make([]vk.PresentModeKHR, present_mode_count);
+		vk.GetPhysicalDeviceSurfacePresentModesKHR(dev, surface, &present_mode_count, raw_data(swap_chain.support.present_modes));
+	}
+}
+
+pickPhysicalDevice :: proc(using ctx: ^Context) {
+
+    device_count: u32;
+    vk.EnumeratePhysicalDevices(instance, &device_count, nil)
+
+
    
-    if deviceCount == 0 {
+    if device_count == 0 {
         fmt.print("no gpu with vulkan support found")
         os.exit(1);
     }
 
-    devices := make([]vk.PhysicalDevice, deviceCount);
-    vk.EnumeratePhysicalDevices(instance, &deviceCount, raw_data(devices))
+    devices := make([]vk.PhysicalDevice, device_count);
+    vk.EnumeratePhysicalDevices(instance, &device_count, raw_data(devices))
 
-    suitability :: proc(dev: vk.PhysicalDevice) -> bool {
+    suitability :: proc(using ctx: ^Context, dev: vk.PhysicalDevice) -> int {
+
         props :vk.PhysicalDeviceProperties;
         features :vk.PhysicalDeviceFeatures;
         vk.GetPhysicalDeviceProperties(dev, &props);
         vk.GetPhysicalDeviceFeatures(dev, &features);
 
-        indices := findQueueFamilies(dev);
-        if &indices.graphicsFamily != nil {
-            return true
-        } else {
-            return false
-        }
+        score := 0;
+		if props.deviceType == .DISCRETE_GPU do score += 1000;
+		score += cast(int)props.limits.maxImageDimension2D;
+
+        if !features.geometryShader do return 0;
+        if !checkDeviceExtensionSupport(dev) do return 0;
+
+        querySwapChainDetails(ctx, dev);
+		if len(swap_chain.support.formats) == 0 || len(swap_chain.support.present_modes) == 0 do return 0;
+		
+		return score;
     }
 
-    for device in devices {
-        if (suitability(device)) {
-            physicalDevice = device;
-            break;
-        }
-    }
-
-    if physicalDevice == nil {
-        fmt.print("nfailed to find gpu")
-    }
+	hiscore := 0;
+	for dev in devices
+	{
+		score := suitability(ctx, dev);
+		if score > hiscore
+		{
+			physicalDevice = dev;
+			hiscore = score;
+		}
+	}
+	
+	if (hiscore == 0)
+	{
+		fmt.eprintf("ERROR: Failed to find a suitable GPU\n");
+		os.exit(1);
+	}
 }
 
 createLogicalDevice :: proc() {
@@ -115,7 +191,7 @@ checkValidaitonLayerSupport :: proc() -> bool{
     return true;
 }
 
-initWindow :: proc() {
+initWindow :: proc(using ctx: ^Context) {
     glfw.Init()
 
     glfw.WindowHint(glfw.CLIENT_API, glfw.NO_API)
@@ -143,20 +219,23 @@ initWindow :: proc() {
 
 }
 
-initVulkan :: proc() {
+initVulkan :: proc(using ctx: ^Context) {
     vulkan_lib, loaded := dynlib.load_library("libvulkan.so")
     assert(loaded)
     vkGetInstanceProcAddr, found := dynlib.symbol_address(vulkan_lib, "vkGetInstanceProcAddr")
     assert(found)
     vk.load_proc_addresses(vkGetInstanceProcAddr)
 
-    createInstance()
-    // setup debug messenger
-    pickPhysicalDevice()
-    createLogicalDevice()
+    createInstance(ctx)
+
+    extensions := getExtensions();
+	for ext in &extensions do fmt.println(cstring(&ext.extensionName[0]));
+
+    pickPhysicalDevice(ctx)
+    // createLogicalDevice()
 }
 
-createInstance :: proc() {
+createInstance :: proc(using ctx: ^Context) {
     if !checkValidaitonLayerSupport() {
         fmt.println("Failed to add validation layer support");
 
@@ -175,25 +254,43 @@ createInstance :: proc() {
   
     glfwExtensions := glfw.GetRequiredInstanceExtensions()
 
-    extendedExtensions := make([dynamic]cstring, len(glfwExtensions)+1)
-
-    append(&extendedExtensions, vk.EXT_DEBUG_UTILS_EXTENSION_NAME);
-
-    createInfo.enabledExtensionCount = cast(u32)len(extendedExtensions)
-    createInfo.ppEnabledExtensionNames = raw_data(extendedExtensions)
+    createInfo.enabledExtensionCount = cast(u32)len(glfwExtensions)
+    createInfo.ppEnabledExtensionNames = raw_data(glfwExtensions)
 
     createInfo.enabledLayerCount = 0;
 
-    // if validation layers
-    createInfo.enabledLayerCount = len(VALIDATION_LAYERS)
-    createInfo.pNext = nil
-  
-    result := vk.CreateInstance(&createInfo, nil, &instance);
+    when ODIN_DEBUG {
+        layerCount: u32;
+        vk.EnumerateInstanceLayerProperties(&layerCount, nil)
+        layers := make([]vk.LayerProperties, layerCount)
+        vk.EnumerateInstanceLayerProperties(&layerCount, raw_data(layers))
 
-    if result != vk.Result.SUCCESS {
-        fmt.println("failed to create instance");
+        outer: for name in VALIDATION_LAYERS {
+
+            for layer in &layers {
+                if name == cstring(&layer.layerName[0]) do continue outer;
+            }
+            fmt.eprintf("ERROR: validation layer %q not available\n", name);
+			os.exit(1);
+        }
+        	
+		create_info.ppEnabledLayerNames = &VALIDATION_LAYERS[0];
+		create_info.enabledLayerCount = len(VALIDATION_LAYERS);
+		fmt.println("Validation Layers Loaded");
+    } else {
+        createInfo.enabledLayerCount = 0
     }
+  
 
+    if vk.CreateInstance(&createInfo, nil, &instance) != .SUCCESS {
+        fmt.println("failed to create instance");
+        return;
+    }
+    fmt.println("Instance Created");
+
+}
+
+getExtensions :: proc() -> []vk.ExtensionProperties {
     n_ext: u32;
 	vk.EnumerateInstanceExtensionProperties(nil, &n_ext, nil);
     fmt.printf("%d number of extenstions available\n", n_ext);
@@ -202,21 +299,19 @@ createInstance :: proc() {
     vk.EnumerateInstanceExtensionProperties(nil, &n_ext, raw_data(extensions));
 
     for e in extensions {
-        fmt.printf("%s | ", e.extensionName);
+        //fmt.printf("%s | ", e.extensionName);
     }
 
-    
-
-
+    return extensions
 }
 
-loop :: proc() {
+loop :: proc(using ctx: ^Context) {
     for !glfw.WindowShouldClose(window) {
         glfw.PollEvents();
     }
 }
 
-exit :: proc() {
+exit :: proc(using ctx: ^Context) {
     // vk shutdowns
     vk.DestroyInstance(instance, nil)
 
@@ -230,10 +325,10 @@ main :: proc() {
 
     using ctx: Context;
 
-    initWindow(ctx);
-    initVulkan(ctx);
-    loop(ctx);
-    exit();
+    initWindow(&ctx);
+    initVulkan(&ctx);
+    loop(&ctx);
+    exit(&ctx);
 
 }
 
